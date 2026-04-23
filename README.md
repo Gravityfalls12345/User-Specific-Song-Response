@@ -33,6 +33,7 @@ Determines the correct track number and sends track number to ESP32‑B
 
 ESP32‑B — Audio Engine -
 Receives track number from STM32 and reads the corresponding WAV file from the microSD card 
+
 Streams WAV audio to a JBL speaker using Bluetooth A2DP
 
 ## Full System Flow
