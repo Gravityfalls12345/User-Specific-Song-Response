@@ -1,0 +1,231 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <BluetoothA2DPSource.h>
+
+#define SD_CS   5
+#define UART_RX 16
+#define UART_TX 17
+
+BluetoothA2DPSource a2dp_source;
+
+File audioFile;
+uint32_t dataStart = 0;
+uint32_t dataEnd   = 0;
+
+volatile bool isPlaying = false;
+volatile bool sdDone    = false;
+bool a2dpStarted        = false;
+
+// ---- Tiny 8 KB buffer ----
+#define SMALL_BUF 8192
+static uint8_t smallBuffer[SMALL_BUF];
+volatile uint32_t smallIndex = 0;
+volatile uint32_t smallCount = 0;
+
+portMUX_TYPE bufMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Track currently playing (0 = none, 1 = phone1, 2 = phone2)
+int currentTrack = 0;
+
+String getFilename(int track) {
+  if (track == 1) return "/music/CFIntro.wav";
+  if (track == 2) return "/music/DDIntro.wav";
+  if (track == 3) return "/music/JCIntro.wav";
+  if (track == 4) return "/music/ESIntro.wav";
+  return "/music/CFIntro.wav";
+}
+
+
+// -------- SD PREFETCH TASK --------
+void sdPrefetchTask(void* pv) {
+
+  while (isPlaying) {
+
+    if (audioFile && audioFile.position() < dataEnd) {
+
+      portENTER_CRITICAL(&bufMux);
+      uint32_t space = SMALL_BUF - smallCount;
+      portEXIT_CRITICAL(&bufMux);
+
+      if (space > 0) {
+        uint32_t toRead = space;
+        if (toRead > 1024) toRead = 1024;
+
+        uint8_t temp[1024];
+        int32_t n = audioFile.read(temp, toRead);
+
+        if (n > 0) {
+          portENTER_CRITICAL(&bufMux);
+          for (int i = 0; i < n; i++) {
+            if (smallCount >= SMALL_BUF) break;
+            smallBuffer[(smallIndex + smallCount) % SMALL_BUF] = temp[i];
+            smallCount++;
+          }
+          portEXIT_CRITICAL(&bufMux);
+        } else {
+          sdDone = true;
+        }
+
+      } else {
+        vTaskDelay(1);
+      }
+
+    } else {
+      sdDone = true;
+      vTaskDelay(5);
+    }
+  }
+
+  vTaskDelete(NULL);
+}
+
+// -------- WAV INIT (Interrupt‑Safe) --------
+bool initWav(const String& filename) {
+
+  // STOP current playback immediately
+  isPlaying = false;
+  sdDone = true;
+
+  if (audioFile) audioFile.close();
+
+  // Reset tiny buffer
+  portENTER_CRITICAL(&bufMux);
+  smallIndex = 0;
+  smallCount = 0;
+  portEXIT_CRITICAL(&bufMux);
+
+  Serial.print("Opening WAV: ");
+  Serial.println(filename);
+
+  audioFile = SD.open(filename);
+  if (!audioFile) {
+    Serial.println("Failed to open WAV file!");
+    return false;
+  }
+
+  // Parse WAV header to find "data" chunk
+  audioFile.seek(12);
+  while (true) {
+    char id[4];
+    if (audioFile.read((uint8_t*)id, 4) != 4) return false;
+
+    uint32_t size = audioFile.read() |
+                    (audioFile.read() << 8) |
+                    (audioFile.read() << 16) |
+                    (audioFile.read() << 24);
+
+    if (strncmp(id, "data", 4) == 0) {
+      dataStart = audioFile.position();
+      dataEnd   = dataStart + size;
+      break;
+    }
+    audioFile.seek(audioFile.position() + size);
+  }
+
+  audioFile.seek(dataStart);
+
+  // Start new playback
+  isPlaying = true;
+  sdDone = false;
+
+  xTaskCreatePinnedToCore(sdPrefetchTask, "sdPrefetch", 4096, NULL, 1, NULL, 0);
+
+  return true;
+}
+
+// -------- A2DP CALLBACK --------
+int32_t get_sound_data(Frame* frames, int32_t frameCount) {
+  uint8_t sampleBytes[4];
+
+  for (int i = 0; i < frameCount; i++) {
+
+    if (!isPlaying) {
+      frames[i].channel1 = 0;
+      frames[i].channel2 = 0;
+      continue;
+    }
+
+    bool haveData = false;
+
+    portENTER_CRITICAL(&bufMux);
+    if (smallCount >= 4) {
+      for (int j = 0; j < 4; j++) {
+        sampleBytes[j] = smallBuffer[(smallIndex + j) % SMALL_BUF];
+      }
+      smallIndex = (smallIndex + 4) % SMALL_BUF;
+      smallCount -= 4;
+      haveData = true;
+    }
+    portEXIT_CRITICAL(&bufMux);
+
+    if (haveData) {
+      int16_t L = sampleBytes[0] | (sampleBytes[1] << 8);
+      int16_t R = sampleBytes[2] | (sampleBytes[3] << 8);
+      frames[i].channel1 = L;
+      frames[i].channel2 = R;
+    } else {
+      frames[i].channel1 = 0;
+      frames[i].channel2 = 0;
+
+      if (sdDone && smallCount < 4) {
+        isPlaying = false;
+        if (audioFile) audioFile.close();
+      }
+    }
+  }
+
+  return frameCount;
+}
+
+// -------- UART HANDLING (Accepts PLAY:x) --------
+String uartLine;
+
+void handleUART() {
+  while (Serial1.available()) {
+    char c = (char)Serial1.read();
+
+    if (c == '\n' || c == '\r') {
+
+      // Expecting "PLAY:1" or "PLAY:2"
+      if (uartLine.startsWith("PLAY:")) {
+        int newTrack = uartLine.substring(5).toInt();
+
+        // Only interrupt if track CHANGED
+        if (newTrack != currentTrack) {
+          currentTrack = newTrack;
+
+          String filename = getFilename(currentTrack);
+
+          Serial.print("Switching to track ");
+          Serial.println(currentTrack);
+
+          initWav(filename);
+        }
+      }
+
+      uartLine = "";
+    } else {
+      uartLine += c;
+    }
+  }
+}
+
+// -------- SETUP / LOOP --------
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, UART_RX, UART_TX);
+
+  SPI.begin(18, 19, 23, SD_CS);
+  SD.begin(SD_CS);
+
+  Serial.println("ESP32-32E Audio Player Ready (Interrupt‑Play, 8KB Buffer)");
+
+  // Start A2DP immediately
+  a2dp_source.start("LifeAsI's JBL Charge 6", get_sound_data);
+  a2dpStarted = true;
+}
+
+void loop() {
+  handleUART();
+}
