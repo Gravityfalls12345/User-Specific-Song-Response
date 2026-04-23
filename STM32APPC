@@ -1,0 +1,70 @@
+#include "app.h"
+#include <string.h>
+#include <stdio.h>
+
+extern UART_HandleTypeDef huart3;   // From ESP32-S3 (BLE scanner)
+extern UART_HandleTypeDef huart1;   // To ESP32-32E (audio player)
+extern UART_HandleTypeDef huart2;   // Debug UART
+
+uint8_t rx_char;
+
+void Debug(const char *msg)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART3)   // From ESP32-S3
+    {
+        char c = rx_char;
+
+        char dbg[32];
+        sprintf(dbg, "RX FROM S3: %c\r\n", c);
+        Debug(dbg);
+
+        // ---- USER 1 ----
+        if (c == '1')
+        {
+            Debug("Sending PLAY:1 to ESP32-32E\r\n");
+            HAL_UART_Transmit(&huart1, (uint8_t*)"PLAY:1\n", 7, HAL_MAX_DELAY);
+        }
+
+        // ---- USER 2 ----
+        else if (c == '2')
+        {
+            Debug("Sending PLAY:2 to ESP32-32E\r\n");
+            HAL_UART_Transmit(&huart1, (uint8_t*)"PLAY:2\n", 7, HAL_MAX_DELAY);
+        }
+
+        // ---- USER 3 (JCIntro.wav) ----
+        else if (c == '3')
+        {
+            Debug("Sending PLAY:3 to ESP32-32E\r\n");
+            HAL_UART_Transmit(&huart1, (uint8_t*)"PLAY:3\n", 7, HAL_MAX_DELAY);
+        }
+
+        // ---- USER 4 (ESIntro.wav) ----
+        else if (c == '4')
+        {
+            Debug("Sending PLAY:4 to ESP32-32E\r\n");
+            HAL_UART_Transmit(&huart1, (uint8_t*)"PLAY:4\n", 7, HAL_MAX_DELAY);
+        }
+
+        // Re-arm interrupt
+        HAL_UART_Receive_IT(&huart3, &rx_char, 1);
+    }
+}
+
+void App_Init(void)
+{
+    Debug("STM32 READY\r\n");
+
+    // Start receiving from ESP32-S3
+    HAL_UART_Receive_IT(&huart3, &rx_char, 1);
+}
+
+void App_MainLoop(void)
+{
+    // Nothing needed
+}
