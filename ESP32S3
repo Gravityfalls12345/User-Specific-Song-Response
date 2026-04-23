@@ -1,0 +1,118 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+#define UART_TX 17
+#define UART_RX 18
+
+// ---- UUIDs for all 4 users ----
+static const char* UUID_PHONE_1 = "00000000-0000-0000-0000-000000000001";
+static const char* UUID_PHONE_2 = "00000000-0000-0000-0000-000000000002";
+static const char* UUID_PHONE_3 = "00000000-0000-0000-0000-000000000003"; // JCIntro.wav
+static const char* UUID_PHONE_4 = "00000000-0000-0000-0000-000000000004"; // ESIntro.wav
+
+BLEScan* pBLEScan;
+
+// ---- Detection flags ----
+bool phone1Seen = false;
+bool phone2Seen = false;
+bool phone3Seen = false;
+bool phone4Seen = false;
+
+// ---- Active user tracking ----
+int currentActive = 0;   // 0 = none, 1 = phone1, 2 = phone2, 3 = phone3, 4 = phone4
+unsigned long cooldownEnd = 0;
+const unsigned long COOLDOWN_MS = 20000;  // 20 seconds cooldown
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) {
+
+    if (!dev.haveServiceUUID()) return;
+
+    int count = dev.getServiceUUIDCount();
+    for (int i = 0; i < count; i++) {
+
+      String uuidStr = dev.getServiceUUID(i).toString().c_str();
+      uuidStr.toUpperCase();
+
+      if (uuidStr.equalsIgnoreCase(UUID_PHONE_1)) phone1Seen = true;
+      if (uuidStr.equalsIgnoreCase(UUID_PHONE_2)) phone2Seen = true;
+      if (uuidStr.equalsIgnoreCase(UUID_PHONE_3)) phone3Seen = true;
+      if (uuidStr.equalsIgnoreCase(UUID_PHONE_4)) phone4Seen = true;
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, UART_RX, UART_TX);
+
+  BLEDevice::init("BLE_Scanner");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  Serial.println("ESP32-S3 BLE scanner ready");
+}
+
+void loop() {
+
+  // Reset detection flags each scan cycle
+  phone1Seen = false;
+  phone2Seen = false;
+  phone3Seen = false;
+  phone4Seen = false;
+
+  // Scan for 1 second
+  pBLEScan->start(1, false);
+  pBLEScan->clearResults();
+
+  int newActive = currentActive;
+
+  // ---- PRIORITY ORDER: 4 > 3 > 2 > 1 ----
+  if (phone4Seen) newActive = 4;
+  else if (phone3Seen) newActive = 3;
+  else if (phone2Seen) newActive = 2;
+  else if (phone1Seen) newActive = 1;
+  else newActive = 0;
+
+  unsigned long now = millis();
+
+  // -------------------------------
+  // COOLDOWN LOGIC
+  // -------------------------------
+  if (now < cooldownEnd) {
+
+    // Allow switching ONLY if a *new* user appears
+    if (newActive != currentActive && newActive != 0) {
+
+      currentActive = newActive;
+      cooldownEnd = now + COOLDOWN_MS;
+
+      Serial.print("Switching during cooldown to: ");
+      Serial.println(currentActive);
+      Serial2.println(currentActive);
+    }
+
+    return; // ignore fallback or no detection
+  }
+
+  // -------------------------------
+  // NORMAL LOGIC (no cooldown)
+  // -------------------------------
+  if (newActive != currentActive) {
+    currentActive = newActive;
+
+    if (currentActive != 0) {
+      Serial.print("Detected new active phone: ");
+      Serial.println(currentActive);
+      Serial2.println(currentActive);
+
+      cooldownEnd = now + COOLDOWN_MS;
+    }
+  }
+}
